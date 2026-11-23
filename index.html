@@ -56,6 +56,11 @@ const params = {
   patternSpeed: 0.02,
   size: 34,
   bloom: 0.7,
+  bar: 2.6,           // bar half-length; 0 = classic spiral
+  dust: 1.0,
+  dustCount: 22000,
+  dustOffset: -0.35,  // dust lanes sit on the inner edge of each arm
+  twinkle: 0.35,
   autoRotate: true,
 };
 
@@ -63,15 +68,19 @@ const params = {
 // Stars move along their own ellipse; the spiral pattern persists instead of winding up.
 const uniforms = {
   uTime: { value: 0 },
+  uClock: { value: 0 },      // real time (twinkle shouldn't follow the time-scale slider)
   uSize: { value: params.size },
   uTwist: { value: params.twist },
   uEcc: { value: params.eccentricity },
   uPattern: { value: params.patternSpeed },
+  uBar: { value: params.bar },
+  uTwinkle: { value: params.twinkle },
   uPixelRatio: { value: renderer.getPixelRatio() },
 };
 
 const vertexShader = /* glsl */`
-  uniform float uTime, uSize, uTwist, uEcc, uPattern, uPixelRatio;
+  uniform float uTime, uClock, uSize, uTwist, uEcc, uPattern, uBar, uTwinkle, uPixelRatio;
+  uniform float uOrientOffset, uTwinkleAmt;
   attribute float aRadius;
   attribute float aPhase;
   attribute float aSize;
@@ -80,8 +89,12 @@ const vertexShader = /* glsl */`
   varying vec3 vColor;
   void main() {
     float a = aRadius;
-    float b = a * (1.0 - uEcc * smoothstep(0.0, 2.5, a));   // round core, elliptical disk
-    float orient = a * uTwist + uTime * uPattern;
+    // Inside the bar every orbit shares one orientation and is very elongated;
+    // outside it, orientation twists with radius to form the arms.
+    float inBar = uBar > 0.01 ? 1.0 - smoothstep(uBar * 0.75, uBar * 1.1, a) : 0.0;
+    float ecc = mix(uEcc * smoothstep(0.0, 2.5, a), 0.62 * smoothstep(0.0, 0.6, a), inBar);
+    float b = a * (1.0 - ecc);
+    float orient = max(a - uBar, 0.0) * uTwist + uTime * uPattern + uOrientOffset;
     float t = aPhase + uTime * 0.45 / (a + 0.6);               // ~flat rotation curve
     vec2 e = vec2(cos(t) * a, sin(t) * b);
     float c = cos(orient), s = sin(orient);
@@ -89,7 +102,9 @@ const vertexShader = /* glsl */`
     vec4 mv = modelViewMatrix * vec4(vec3(p.x, 0.0, p.y) + aOffset, 1.0);
     gl_Position = projectionMatrix * mv;
     gl_PointSize = min(aSize * uSize * uPixelRatio / -mv.z, 256.0);
-    vColor = aColor;
+    float seed = fract(aPhase * 7.31);
+    float tw = sin(uClock * (1.5 + seed * 5.0) + aPhase * 91.0) * sin(uClock * 0.7 + seed * 40.0);
+    vColor = aColor * (1.0 + uTwinkle * uTwinkleAmt * tw);
   }
 `;
 
@@ -104,15 +119,34 @@ const fragmentShader = /* glsl */`
   }
 `;
 
-function makeMaterial(soft) {
+// Dust multiplies what's already drawn: white = no change, brownish = absorb (blue more than red).
+const dustFragment = /* glsl */`
+  uniform float uSoft, uDust;
+  varying vec3 vColor;     // r = opacity of this dust clump
+  void main() {
+    vec2 c = gl_PointCoord - 0.5;
+    float d2 = dot(c, c);
+    if (d2 > 0.25) discard;
+    float k = clamp(uDust * vColor.r * exp(-d2 * uSoft), 0.0, 1.0);
+    gl_FragColor = vec4(mix(vec3(1.0), vec3(0.42, 0.3, 0.22), k), 1.0);
+  }
+`;
+
+function makeMaterial(soft, extra = {}) {
   return new THREE.ShaderMaterial({
-    uniforms: { ...uniforms, uSoft: { value: soft } },
+    uniforms: { ...uniforms, uSoft: { value: soft }, uOrientOffset: { value: 0 }, uTwinkleAmt: { value: 0 }, ...extra },
     vertexShader, fragmentShader,
     transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
   });
 }
-const starMaterial = makeMaterial(26);
+const starMaterial = makeMaterial(26, { uTwinkleAmt: { value: 1 } });
 const gasMaterial = makeMaterial(9);
+const dustMaterial = makeMaterial(7, { uOrientOffset: { value: params.dustOffset }, uDust: { value: params.dust } });
+dustMaterial.fragmentShader = dustFragment;
+dustMaterial.blending = THREE.CustomBlending;     // dst = dst * src
+dustMaterial.blendEquation = THREE.AddEquation;
+dustMaterial.blendSrc = THREE.ZeroFactor;
+dustMaterial.blendDst = THREE.SrcColorFactor;
 
 // ---------- generation ----------
 const gauss = () => {
@@ -123,8 +157,20 @@ const gauss = () => {
 };
 
 const C = (hex) => new THREE.Color(hex);
-const coreCol = C('#ffcf8f'), midCol = C('#fff1e0'), outerCol = C('#8fb0ff');
-const youngCol = C('#6f9bff'), hiiCol = C('#ff4d8d'), gasBlue = C('#3c5cff');
+const hiiCol = C('#ff4d8d'), gasBlue = C('#3c5cff');
+
+// Blackbody colour for a temperature in kelvin (Tanner Helland's fit), written into `out`.
+function kelvin(k, out) {
+  const t = k / 100;
+  let r, g, b;
+  if (t <= 66) { r = 255; g = 99.4708025861 * Math.log(t) - 161.1195681661; }
+  else { r = 329.698727446 * Math.pow(t - 60, -0.1332047592); g = 288.1221695283 * Math.pow(t - 60, -0.0755148492); }
+  if (t >= 66) b = 255;
+  else if (t <= 19) b = 0;
+  else b = 138.5177312231 * Math.log(t - 10) - 305.0447927307;
+  const n = (v) => Math.min(255, Math.max(0, v)) / 255;
+  return out.setRGB(n(r), n(g), n(b), THREE.SRGBColorSpace);
+}
 
 function sampleRadius() {
   // exponential disk, truncated
@@ -133,7 +179,8 @@ function sampleRadius() {
   return r;
 }
 
-function buildLayer(count, isGas) {
+function buildLayer(count, kind) {
+  const isGas = kind === 'gas', isDust = kind === 'dust';
   const geo = new THREE.BufferGeometry();
   const pos = new Float32Array(count * 3);          // dummy; real position computed in shader
   const radius = new Float32Array(count);
@@ -144,28 +191,36 @@ function buildLayer(count, isGas) {
   const tmp = new THREE.Color();
 
   for (let i = 0; i < count; i++) {
-    const a = isGas ? 1.5 + Math.random() * (params.radius - 1.5) : sampleRadius();
+    const dustStart = Math.max(params.bar * 0.9, 1.6);
+    const a = isGas ? 1.5 + Math.random() * (params.radius - 1.5)
+            : isDust ? Math.sqrt(dustStart ** 2 + Math.random() * ((params.radius * 0.85) ** 2 - dustStart ** 2))
+            : sampleRadius();
     const t = a / params.radius;
     radius[i] = a;
     phase[i] = Math.random() * Math.PI * 2;
 
-    const spread = isGas ? 0.35 + 0.05 * a : 0.12 + 0.045 * a;
-    const thick = isGas ? 0.12 : 0.08 + 0.7 * Math.exp(-a / 1.2);   // bulge is puffy
+    const spread = isGas ? 0.35 + 0.05 * a : isDust ? 0.08 + 0.015 * a : 0.12 + 0.045 * a;
+    const thick = isGas ? 0.12 : isDust ? 0.05 : 0.08 + 0.7 * Math.exp(-a / 1.2);   // bulge is puffy, dust is thin
     offset[i * 3]     = gauss() * spread;
     offset[i * 3 + 1] = gauss() * thick;
     offset[i * 3 + 2] = gauss() * spread;
 
-    if (isGas) {
+    if (isDust) {
+      const fadeIn = Math.min(1, (a - dustStart) / 1.5);   // no hard inner edge
+      tmp.setRGB((0.025 + Math.random() * 0.04) * fadeIn, 0, 0);   // r channel = opacity
+      size[i] = 4 + Math.random() * 7;
+    } else if (isGas) {
       const pink = Math.random() < 0.45;
       tmp.copy(pink ? hiiCol : gasBlue).multiplyScalar(pink ? 0.012 : 0.009);
       size[i] = 10 + Math.random() * 18;
     } else {
-      if (t < 0.25) tmp.lerpColors(coreCol, midCol, t / 0.25);
-      else tmp.lerpColors(midCol, outerCol, Math.min(1, (t - 0.25) / 0.6));
+      // Old, cool stars in the bulge; warmer mix through the disk; rare hot young stars in the arms.
+      let temp = t < 0.2 ? 3600 + Math.random() * 1800 : 4500 + t * 2500 + gauss() * 900;
       let bright = 0.08 + Math.random() * 0.11;
       size[i] = 0.5 + Math.pow(Math.random(), 7) * 3.5;
-      if (t > 0.18 && Math.random() < 0.03) { tmp.copy(youngCol); bright = 0.35; size[i] *= 1.6; }
-      else if (t > 0.2 && Math.random() < 0.006) { tmp.copy(hiiCol); bright = 0.3; size[i] *= 2.0; }
+      if (t > 0.18 && Math.random() < 0.03) { temp = 11000 + Math.random() * 14000; bright = 0.35; size[i] *= 1.6; }
+      kelvin(Math.max(3000, temp), tmp);
+      if (t > 0.2 && Math.random() < 0.006) { tmp.copy(hiiCol); bright = 0.3; size[i] *= 2.0; }
       tmp.multiplyScalar(bright * (1.0 + 0.6 * Math.exp(-a / 0.8)));
     }
     color[i * 3] = tmp.r; color[i * 3 + 1] = tmp.g; color[i * 3 + 2] = tmp.b;
@@ -177,21 +232,23 @@ function buildLayer(count, isGas) {
   geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
   geo.setAttribute('aOffset', new THREE.BufferAttribute(offset, 3));
   geo.setAttribute('aColor', new THREE.BufferAttribute(color, 3));
-  const pts = new THREE.Points(geo, isGas ? gasMaterial : starMaterial);
+  const pts = new THREE.Points(geo, isDust ? dustMaterial : isGas ? gasMaterial : starMaterial);
   pts.frustumCulled = false;
+  pts.renderOrder = isDust ? 2 : isGas ? 0 : 1;   // dust last so it darkens the light behind it
   return pts;
 }
 
 const galaxy = new THREE.Group();
 galaxy.rotation.z = 0.12;
 scene.add(galaxy);
-let starLayer, gasLayer;
+let starLayer, gasLayer, dustLayer;
 
 function regenerate() {
-  for (const l of [starLayer, gasLayer]) if (l) { galaxy.remove(l); l.geometry.dispose(); }
-  gasLayer = buildLayer(params.gas, true);
-  starLayer = buildLayer(params.stars, false);
-  galaxy.add(gasLayer, starLayer);
+  for (const l of [starLayer, gasLayer, dustLayer]) if (l) { galaxy.remove(l); l.geometry.dispose(); }
+  gasLayer = buildLayer(params.gas, 'gas');
+  starLayer = buildLayer(params.stars, 'stars');
+  dustLayer = buildLayer(params.dustCount, 'dust');
+  galaxy.add(gasLayer, starLayer, dustLayer);
 }
 regenerate();
 
@@ -244,6 +301,7 @@ const gui = new GUI({ title: 'Galaxy' });
 const shape = gui.addFolder('Shape');
 shape.add(params, 'twist', 0, 1, 0.01).name('arm twist').onChange(v => uniforms.uTwist.value = v);
 shape.add(params, 'eccentricity', 0, 0.6, 0.01).onChange(v => uniforms.uEcc.value = v);
+shape.add(params, 'bar', 0, 5, 0.05).name('bar length').onChange(v => uniforms.uBar.value = v).onFinishChange(regenerate);
 shape.add(params, 'stars', 10000, 400000, 10000).onFinishChange(regenerate);
 shape.add(params, 'gas', 0, 20000, 500).name('gas clouds').onFinishChange(regenerate);
 shape.add(params, 'scaleLength', 1, 8, 0.1).name('disk scale').onFinishChange(regenerate);
@@ -254,6 +312,10 @@ motion.add(params, 'autoRotate').name('camera orbit').onChange(v => controls.aut
 const look = gui.addFolder('Look');
 look.add(params, 'size', 5, 100, 1).name('star size').onChange(v => uniforms.uSize.value = v);
 look.add(params, 'bloom', 0, 2.5, 0.01).onChange(v => bloom.strength = v);
+look.add(params, 'dust', 0, 3, 0.01).name('dust lanes').onChange(v => dustMaterial.uniforms.uDust.value = v);
+look.add(params, 'dustOffset', -1, 1, 0.01).name('dust offset').onChange(v => dustMaterial.uniforms.uOrientOffset.value = v);
+look.add(params, 'dustCount', 0, 60000, 1000).name('dust clouds').onFinishChange(regenerate);
+look.add(params, 'twinkle', 0, 1, 0.01).onChange(v => uniforms.uTwinkle.value = v);
 gui.add({ regenerate }, 'regenerate');
 if (innerWidth < 600) gui.close();
 
@@ -269,6 +331,7 @@ const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   uniforms.uTime.value += dt * params.timeScale;
+  uniforms.uClock.value += dt;
   controls.update();
   composer.render();
 });

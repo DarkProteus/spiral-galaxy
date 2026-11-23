@@ -16,4 +16,4 @@ Then open http://localhost:8000. Opening the file directly may not work, because
 
 ## Controls
 
-Drag to orbit and scroll to zoom. The panel adjusts arm twist, orbit eccentricity, time scale, pattern speed, star and gas counts, star size and bloom.
+Drag to orbit and scroll to zoom. The panel adjusts arm twist, orbit eccentricity, bar length, time scale, pattern speed, star and gas counts, star size, bloom, dust lanes and twinkle.
