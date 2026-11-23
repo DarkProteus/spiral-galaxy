@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spiral Galaxy</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #hint { position: fixed; left: 16px; bottom: 16px; color: #ffffff70; font-size: 12px; pointer-events: none; letter-spacing: .03em; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hint">drag to orbit · scroll to zoom · tweak the panel</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.05, 2000);
+camera.position.set(0, 14, 24);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.minDistance = 2;
+controls.maxDistance = 70;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.25;
+
+// ---------- parameters ----------
+const params = {
+  stars: 140000,
+  gas: 5000,
+  radius: 13,
+  scaleLength: 3.6,
+  twist: 0.38,        // ellipse orientation change per unit radius -> spiral arms
+  eccentricity: 0.34, // how squashed each orbit is
+  timeScale: 1.0,
+  patternSpeed: 0.02,
+  size: 34,
+  bloom: 0.7,
+  autoRotate: true,
+};
+
+// Shared uniforms: arms are a density wave made of nested, rotated elliptical orbits.
+// Stars move along their own ellipse; the spiral pattern persists instead of winding up.
+const uniforms = {
+  uTime: { value: 0 },
+  uSize: { value: params.size },
+  uTwist: { value: params.twist },
+  uEcc: { value: params.eccentricity },
+  uPattern: { value: params.patternSpeed },
+  uPixelRatio: { value: renderer.getPixelRatio() },
+};
+
+const vertexShader = /* glsl */`
+  uniform float uTime, uSize, uTwist, uEcc, uPattern, uPixelRatio;
+  attribute float aRadius;
+  attribute float aPhase;
+  attribute float aSize;
+  attribute vec3 aOffset;
+  attribute vec3 aColor;
+  varying vec3 vColor;
+  void main() {
+    float a = aRadius;
+    float b = a * (1.0 - uEcc * smoothstep(0.0, 2.5, a));   // round core, elliptical disk
+    float orient = a * uTwist + uTime * uPattern;
+    float t = aPhase + uTime * 0.45 / (a + 0.6);               // ~flat rotation curve
+    vec2 e = vec2(cos(t) * a, sin(t) * b);
+    float c = cos(orient), s = sin(orient);
+    vec2 p = vec2(e.x * c - e.y * s, e.x * s + e.y * c);
+    vec4 mv = modelViewMatrix * vec4(vec3(p.x, 0.0, p.y) + aOffset, 1.0);
+    gl_Position = projectionMatrix * mv;
+    gl_PointSize = min(aSize * uSize * uPixelRatio / -mv.z, 256.0);
+    vColor = aColor;
+  }
+`;
+
+const fragmentShader = /* glsl */`
+  uniform float uSoft;
+  varying vec3 vColor;
+  void main() {
+    vec2 c = gl_PointCoord - 0.5;
+    float d2 = dot(c, c);
+    if (d2 > 0.25) discard;
+    gl_FragColor = vec4(vColor * exp(-d2 * uSoft), 1.0);
+  }
+`;
+
+function makeMaterial(soft) {
+  return new THREE.ShaderMaterial({
+    uniforms: { ...uniforms, uSoft: { value: soft } },
+    vertexShader, fragmentShader,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+}
+const starMaterial = makeMaterial(26);
+const gasMaterial = makeMaterial(9);
+
+// ---------- generation ----------
+const gauss = () => {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+};
+
+const C = (hex) => new THREE.Color(hex);
+const coreCol = C('#ffcf8f'), midCol = C('#fff1e0'), outerCol = C('#8fb0ff');
+const youngCol = C('#6f9bff'), hiiCol = C('#ff4d8d'), gasBlue = C('#3c5cff');
+
+function sampleRadius() {
+  // exponential disk, truncated
+  let r;
+  do { r = -Math.log(1 - Math.random()) * params.scaleLength; } while (r > params.radius);
+  return r;
+}
+
+function buildLayer(count, isGas) {
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count * 3);          // dummy; real position computed in shader
+  const radius = new Float32Array(count);
+  const phase = new Float32Array(count);
+  const size = new Float32Array(count);
+  const offset = new Float32Array(count * 3);
+  const color = new Float32Array(count * 3);
+  const tmp = new THREE.Color();
+
+  for (let i = 0; i < count; i++) {
+    const a = isGas ? 1.5 + Math.random() * (params.radius - 1.5) : sampleRadius();
+    const t = a / params.radius;
+    radius[i] = a;
+    phase[i] = Math.random() * Math.PI * 2;
+
+    const spread = isGas ? 0.35 + 0.05 * a : 0.12 + 0.045 * a;
+    const thick = isGas ? 0.12 : 0.08 + 0.7 * Math.exp(-a / 1.2);   // bulge is puffy
+    offset[i * 3]     = gauss() * spread;
+    offset[i * 3 + 1] = gauss() * thick;
+    offset[i * 3 + 2] = gauss() * spread;
+
+    if (isGas) {
+      const pink = Math.random() < 0.45;
+      tmp.copy(pink ? hiiCol : gasBlue).multiplyScalar(pink ? 0.012 : 0.009);
+      size[i] = 10 + Math.random() * 18;
+    } else {
+      if (t < 0.25) tmp.lerpColors(coreCol, midCol, t / 0.25);
+      else tmp.lerpColors(midCol, outerCol, Math.min(1, (t - 0.25) / 0.6));
+      let bright = 0.08 + Math.random() * 0.11;
+      size[i] = 0.5 + Math.pow(Math.random(), 7) * 3.5;
+      if (t > 0.18 && Math.random() < 0.03) { tmp.copy(youngCol); bright = 0.35; size[i] *= 1.6; }
+      else if (t > 0.2 && Math.random() < 0.006) { tmp.copy(hiiCol); bright = 0.3; size[i] *= 2.0; }
+      tmp.multiplyScalar(bright * (1.0 + 0.6 * Math.exp(-a / 0.8)));
+    }
+    color[i * 3] = tmp.r; color[i * 3 + 1] = tmp.g; color[i * 3 + 2] = tmp.b;
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aRadius', new THREE.BufferAttribute(radius, 1));
+  geo.setAttribute('aPhase', new THREE.BufferAttribute(phase, 1));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  geo.setAttribute('aOffset', new THREE.BufferAttribute(offset, 3));
+  geo.setAttribute('aColor', new THREE.BufferAttribute(color, 3));
+  const pts = new THREE.Points(geo, isGas ? gasMaterial : starMaterial);
+  pts.frustumCulled = false;
+  return pts;
+}
+
+const galaxy = new THREE.Group();
+galaxy.rotation.z = 0.12;
+scene.add(galaxy);
+let starLayer, gasLayer;
+
+function regenerate() {
+  for (const l of [starLayer, gasLayer]) if (l) { galaxy.remove(l); l.geometry.dispose(); }
+  gasLayer = buildLayer(params.gas, true);
+  starLayer = buildLayer(params.stars, false);
+  galaxy.add(gasLayer, starLayer);
+}
+regenerate();
+
+// ---------- core glow ----------
+{
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 256;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grd.addColorStop(0, 'rgba(255,230,190,1)');
+  grd.addColorStop(0.2, 'rgba(255,180,110,0.35)');
+  grd.addColorStop(1, 'rgba(255,140,60,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.3,
+  }));
+  sprite.scale.setScalar(5.5);
+  galaxy.add(sprite);
+}
+
+// ---------- background stars ----------
+{
+  const n = 7000, p = new Float32Array(n * 3), c = new Float32Array(n * 3);
+  const v = new THREE.Vector3(), col = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    v.set(gauss(), gauss(), gauss()).normalize().multiplyScalar(300 + Math.random() * 400);
+    p.set([v.x, v.y, v.z], i * 3);
+    col.setHSL(0.55 + Math.random() * 0.12, 0.4, 0.08 + Math.pow(Math.random(), 6) * 0.35);
+    c.set([col.r, col.g, col.b], i * 3);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(p, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  scene.add(new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 1.0, sizeAttenuation: false, vertexColors: true, depthWrite: false,
+  })));
+}
+
+// ---------- post ----------
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), params.bloom, 0.5, 0.05);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ---------- GUI ----------
+const gui = new GUI({ title: 'Galaxy' });
+const shape = gui.addFolder('Shape');
+shape.add(params, 'twist', 0, 1, 0.01).name('arm twist').onChange(v => uniforms.uTwist.value = v);
+shape.add(params, 'eccentricity', 0, 0.6, 0.01).onChange(v => uniforms.uEcc.value = v);
+shape.add(params, 'stars', 10000, 400000, 10000).onFinishChange(regenerate);
+shape.add(params, 'gas', 0, 20000, 500).name('gas clouds').onFinishChange(regenerate);
+shape.add(params, 'scaleLength', 1, 8, 0.1).name('disk scale').onFinishChange(regenerate);
+const motion = gui.addFolder('Motion');
+motion.add(params, 'timeScale', 0, 8, 0.1).name('time scale');
+motion.add(params, 'patternSpeed', -0.2, 0.2, 0.005).name('pattern speed').onChange(v => uniforms.uPattern.value = v);
+motion.add(params, 'autoRotate').name('camera orbit').onChange(v => controls.autoRotate = v);
+const look = gui.addFolder('Look');
+look.add(params, 'size', 5, 100, 1).name('star size').onChange(v => uniforms.uSize.value = v);
+look.add(params, 'bloom', 0, 2.5, 0.01).onChange(v => bloom.strength = v);
+gui.add({ regenerate }, 'regenerate');
+if (innerWidth < 600) gui.close();
+
+// ---------- loop ----------
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  uniforms.uTime.value += dt * params.timeScale;
+  controls.update();
+  composer.render();
+});
+</script>
+</body>
+</html>
